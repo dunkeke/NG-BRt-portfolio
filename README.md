@@ -32,3 +32,10 @@ streamlit run portfolio_app.py
 
 - 默认通过 `yfinance` 抓取数据（可在侧边栏调整 ticker）；
 - 若 TTF / JKM 抓取失败，可上传包含 `Date` 与价格列的 CSV。
+
+
+## 数据口径提醒
+
+- HH 腿在 Yahoo 默认使用 `NG=F`（NYMEX Natural Gas）作为风险管理代理；不建议混用 `HH=F` look-alik。
+- JKM 建议优先上传本地 CSV（date, price）。
+- 支持三类优化：最小方差（无约束/带约束）、风险平价、因子覆盖+风险预算。

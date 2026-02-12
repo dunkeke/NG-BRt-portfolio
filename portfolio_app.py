@@ -8,6 +8,14 @@ try:
 except ImportError:
     yf = None
 
+ASSETS = ["Brent", "HH", "TTF", "JKM"]
+DEFAULT_TICKERS = {
+    "Brent": "BZ=F",
+    "HH": "NG=F",  # use NG=F as HH proxy on Yahoo
+    "TTF": "TTF=F",
+    "JKM": "",
+}
+
 
 DEFAULT_TICKERS = {
     "Brent": "BZ=F",
@@ -18,8 +26,10 @@ DEFAULT_TICKERS = {
 
 
 def load_yahoo_series(ticker: str, start: str, end: str) -> pd.Series:
+    if not ticker:
+        raise ValueError("Empty ticker.")
     if yf is None:
-        raise RuntimeError("yfinance is not installed. Please install yfinance or upload data.")
+        raise RuntimeError("yfinance is not installed.")
 
     df = pd.DataFrame()
     dl = getattr(yf, "download", None)
@@ -30,8 +40,7 @@ def load_yahoo_series(ticker: str, start: str, end: str) -> pd.Series:
             df = pd.DataFrame()
 
     if df.empty:
-        tk = yf.Ticker(ticker)
-        df = tk.history(start=start, end=end, auto_adjust=False)
+        df = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False)
 
     if df.empty:
         raise ValueError(f"No data returned for ticker {ticker}.")
@@ -41,253 +50,254 @@ def load_yahoo_series(ticker: str, start: str, end: str) -> pd.Series:
 
     price_col = "Adj Close" if "Adj Close" in df.columns else "Close"
     if price_col not in df.columns:
-        raise ValueError(f"Ticker {ticker} missing Close/Adj Close column.")
+        raise ValueError(f"Ticker {ticker} missing Close/Adj Close.")
 
-    return df[price_col].rename(ticker)
+    out = df[price_col].copy()
+    out.index = pd.to_datetime(out.index).tz_localize(None)
+    return out.rename(ticker)
 
 
 def parse_uploaded_csv(upload: st.runtime.uploaded_file_manager.UploadedFile) -> pd.Series:
     df = pd.read_csv(upload)
-    date_col_candidates = [c for c in df.columns if "date" in c.lower()]
-    if not date_col_candidates:
-        raise ValueError("CSV must contain a date-like column.")
-    date_col = date_col_candidates[0]
+    date_col = next((c for c in df.columns if "date" in c.lower()), None)
+    if date_col is None:
+        raise ValueError("CSV needs date column.")
+    price_col = next((c for c in df.columns if c != date_col), None)
+    if price_col is None:
+        raise ValueError("CSV needs price column.")
     df[date_col] = pd.to_datetime(df[date_col])
-    df = df.set_index(date_col).sort_index()
-    price_cols = [c for c in df.columns if c.lower() not in ("date", "datetime")]
-    if not price_cols:
-        raise ValueError("CSV must contain a price column besides date.")
-    return df[price_cols[0]].rename(upload.name)
+    s = df.set_index(date_col).sort_index()[price_col]
+    s.index = pd.to_datetime(s.index).tz_localize(None)
+    return s.astype(float)
 
 
 def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    return prices.pct_change().dropna(how="any")
+    return prices.pct_change().replace([np.inf, -np.inf], np.nan).dropna(how="any")
 
 
-def compute_volatility(returns: pd.DataFrame, window: int) -> pd.DataFrame:
-    vol = returns.rolling(window=window).std() * np.sqrt(252)
-    return vol.dropna(how="any")
+def ewma_cov(returns: pd.DataFrame, lam: float = 0.94) -> np.ndarray:
+    x = returns.values
+    n, k = x.shape
+    if n < 2:
+        return np.cov(x.T)
+    cov = np.cov(x[: min(20, n)].T)
+    for i in range(n):
+        v = x[i].reshape(-1, 1)
+        cov = lam * cov + (1 - lam) * (v @ v.T)
+    return cov
 
 
-def minimum_variance_weights(cov_matrix: np.ndarray, fully_invested: bool = True) -> np.ndarray:
-    n = cov_matrix.shape[0]
+def shrink_cov(sample_cov: np.ndarray, alpha: float = 0.2) -> np.ndarray:
+    diag = np.diag(np.diag(sample_cov))
+    return (1 - alpha) * sample_cov + alpha * diag
+
+
+def estimate_covariance(returns: pd.DataFrame, method: str, ewma_lambda: float, shrink_alpha: float) -> np.ndarray:
+    sample = returns.cov().values
+    if method == "Sample":
+        cov = sample
+    elif method == "EWMA":
+        cov = ewma_cov(returns, lam=ewma_lambda)
+    else:
+        cov = shrink_cov(sample, alpha=shrink_alpha)
+    return cov + 1e-8 * np.eye(cov.shape[0])
+
+
+def project_to_box_simplex(v: np.ndarray, lb: np.ndarray, ub: np.ndarray, target_sum: float = 1.0) -> np.ndarray:
+    w = np.clip(v.copy(), lb, ub)
+    for _ in range(200):
+        diff = target_sum - w.sum()
+        if abs(diff) < 1e-9:
+            break
+        free = (w > lb + 1e-12) & (w < ub - 1e-12)
+        if not np.any(free):
+            break
+        w[free] += diff / free.sum()
+        w = np.clip(w, lb, ub)
+    return w
+
+
+def solve_minvar(cov: np.ndarray, lb: np.ndarray | None = None, ub: np.ndarray | None = None) -> np.ndarray:
+    n = cov.shape[0]
     ones = np.ones(n)
-    regularizer = 1e-8 * np.eye(n)
-    inv_cov = np.linalg.pinv(cov_matrix + regularizer)
-
-    if fully_invested:
-        w = inv_cov @ ones
-        denom = ones.T @ inv_cov @ ones
-        return w / denom if denom != 0 else np.repeat(1 / n, n)
-
-    raw = inv_cov @ ones
-    centered = raw - np.mean(raw)
-    denom = np.sum(np.abs(centered))
-    return centered / denom if denom != 0 else np.zeros(n)
+    inv = np.linalg.pinv(cov)
+    w = inv @ ones
+    denom = ones @ inv @ ones
+    w = w / denom if denom != 0 else np.repeat(1 / n, n)
+    if lb is None or ub is None:
+        return w
+    return project_to_box_simplex(w, lb, ub, 1.0)
 
 
-def optimize_hedge_overlay(
-    cov_matrix: np.ndarray,
-    base_weights: np.ndarray,
-    lambda_reg: float,
-    net_constraint: float = 0.0,
+def risk_contributions(cov: np.ndarray, w: np.ndarray) -> np.ndarray:
+    mrc = cov @ w
+    port_var = max(float(w @ mrc), 1e-12)
+    return w * mrc / port_var
+
+
+def solve_risk_parity(cov: np.ndarray, lb: np.ndarray, ub: np.ndarray, steps: int = 1200, lr: float = 0.03) -> np.ndarray:
+    n = cov.shape[0]
+    w = np.repeat(1 / n, n)
+    target = np.repeat(1 / n, n)
+    for _ in range(steps):
+        rc = risk_contributions(cov, w)
+        grad = rc - target
+        w = w * np.exp(-lr * grad)
+        w = project_to_box_simplex(w, lb, ub, 1.0)
+    return w
+
+
+def pca_factor_loadings(returns: pd.DataFrame, n_factors: int = 3) -> np.ndarray:
+    corr = returns.corr().values
+    vals, vecs = np.linalg.eigh(corr)
+    idx = np.argsort(vals)[::-1]
+    vecs = vecs[:, idx]
+    return vecs[:, :n_factors]
+
+
+def solve_factor_cover(
+    cov: np.ndarray,
+    B: np.ndarray,
+    b_star: np.ndarray,
+    gamma: float,
+    lam_factor: float,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    steps: int = 2000,
+    lr: float = 0.02,
 ) -> np.ndarray:
-    """
-    Solve min_x (x+b)'Σ(x+b) + λx'x, s.t. 1'x = net_constraint.
-    x is hedge overlay, b is existing book weights.
-    """
-    n = len(base_weights)
-    ones = np.ones(n)
-    A = cov_matrix + lambda_reg * np.eye(n)
-    A_inv = np.linalg.pinv(A + 1e-10 * np.eye(n))
-
-    rhs = cov_matrix @ base_weights
-    c1 = ones.T @ A_inv @ ones
-    c2 = ones.T @ A_inv @ rhs
-    nu = -(net_constraint + c2) / c1 if c1 != 0 else 0.0
-    x = -A_inv @ (rhs + nu * ones)
-    return x
+    n = cov.shape[0]
+    w = np.repeat(1 / n, n)
+    L = lam_factor * np.eye(len(b_star))
+    for _ in range(steps):
+        diff = B.T @ w - b_star
+        grad = 2 * (B @ (L @ diff)) + 2 * gamma * (cov @ w)
+        w = w - lr * grad
+        w = project_to_box_simplex(w, lb, ub, 1.0)
+    return w
 
 
-def simulate_dynamic_hedge(
-    returns: pd.DataFrame,
-    base_weights: np.ndarray,
-    lookback: int,
-    rebalance_days: int,
-    lambda_reg: float,
-    net_constraint: float,
-) -> pd.DataFrame:
-    records = []
-    cols = returns.columns
-    for t in range(lookback, len(returns), rebalance_days):
-        cov = returns.iloc[t - lookback : t].cov().values
-        overlay = optimize_hedge_overlay(cov, base_weights, lambda_reg, net_constraint)
-        next_t = min(t + rebalance_days, len(returns))
-        period_ret = returns.iloc[t:next_t]
-        base_pnl = period_ret.values @ base_weights
-        hedged_pnl = period_ret.values @ (base_weights + overlay)
-        for i, dt in enumerate(period_ret.index):
-            records.append(
-                {
-                    "Date": dt,
-                    "Base": base_pnl[i],
-                    "Hedged": hedged_pnl[i],
-                    **{f"overlay_{c}": overlay[j] for j, c in enumerate(cols)},
-                }
-            )
-    out = pd.DataFrame(records).set_index("Date") if records else pd.DataFrame()
-    return out
+def rolling_vol(returns: pd.DataFrame, window: int) -> pd.DataFrame:
+    return returns.rolling(window).std() * np.sqrt(252)
 
 
 def app():
-    st.title("能源组合风险管理与套保优化（BRT / HH / TTF / JKM）")
-    st.caption("支持‘最小方差’与‘最小套保后净风险’两种逻辑，并可做滚动动态再平衡。")
+    st.title("能源组合风险管理（Brent / HH(NG) / TTF / JKM）")
+    st.info("HH 在 Yahoo 默认采用 NG=F（避免 HH=F look-alik 混用）。")
 
-    st.sidebar.header("1) 时间与波动参数")
-    today = datetime.today()
-    default_start = today - timedelta(days=365 * 3)
-    start_date = st.sidebar.date_input("开始日期", default_start)
-    end_date = st.sidebar.date_input("结束日期", today)
+    st.sidebar.header("参数")
+    end = datetime.today()
+    start = end - timedelta(days=365 * 3)
+    start_date = st.sidebar.date_input("开始", start)
+    end_date = st.sidebar.date_input("结束", end)
     if start_date >= end_date:
-        st.error("开始日期必须早于结束日期。")
+        st.error("开始日期需早于结束日期")
         return
 
-    window = st.sidebar.slider("滚动波动率窗口(天)", 10, 180, 30, 5)
+    cov_method = st.sidebar.selectbox("协方差估计", ["Sample", "EWMA", "Shrinkage"], index=1)
+    ewma_lambda = st.sidebar.slider("EWMA λ", 0.80, 0.99, 0.94, 0.01)
+    shrink_alpha = st.sidebar.slider("Shrinkage α", 0.0, 0.8, 0.2, 0.05)
+    vol_window = st.sidebar.slider("滚动波动窗口", 10, 180, 30, 5)
 
-    st.sidebar.header("2) 数据源")
-    use_yahoo_for_all = st.sidebar.checkbox("尝试使用yfinance抓取四个品种", value=True)
-    custom_tickers = {
-        k: st.sidebar.text_input(f"{k} ticker", v) for k, v in DEFAULT_TICKERS.items()
-    }
+    st.sidebar.subheader("数据源")
+    tickers = {}
+    for a in ASSETS:
+        tickers[a] = st.sidebar.text_input(f"{a} ticker", DEFAULT_TICKERS[a])
+    upload_jkm = st.sidebar.file_uploader("JKM CSV（优先上传）", type=["csv"])
 
-    st.sidebar.markdown("若TTF/JKM抓取失败，可上传CSV（含Date和价格列）")
-    ttf_upload = st.sidebar.file_uploader("TTF CSV", type=["csv"])
-    jkm_upload = st.sidebar.file_uploader("JKM CSV", type=["csv"])
+    st.sidebar.subheader("优化模式")
+    mode = st.sidebar.radio("模式", ["MinVar(无约束)", "MinVar(带约束)", "RiskParity", "FactorCover+RiskBudget"])
 
-    st.sidebar.header("3) 公司现货/期货盘位映射(可正可负)")
-    base_pos = {
-        "Brent": st.sidebar.number_input("Brent基准暴露", value=1.0, step=0.1),
-        "HenryHub": st.sidebar.number_input("HH基准暴露", value=0.0, step=0.1),
-        "TTF": st.sidebar.number_input("TTF基准暴露", value=0.0, step=0.1),
-        "JKM": st.sidebar.number_input("JKM基准暴露", value=0.0, step=0.1),
-    }
+    st.sidebar.subheader("权重约束")
+    lb = {}
+    ub = {}
+    default_lb = {"Brent": 0.0, "HH": 0.1, "TTF": 0.05, "JKM": 0.1}
+    default_ub = {"Brent": 0.6, "HH": 0.8, "TTF": 0.8, "JKM": 0.8}
+    for a in ASSETS:
+        lb[a] = st.sidebar.number_input(f"{a} 下限", min_value=0.0, max_value=1.0, value=default_lb[a], step=0.01)
+        ub[a] = st.sidebar.number_input(f"{a} 上限", min_value=0.0, max_value=1.0, value=default_ub[a], step=0.01)
 
-    st.sidebar.header("4) 套保优化参数")
-    objective = st.sidebar.radio(
-        "目标函数",
-        ["最小方差组合(不考虑当前盘位)", "最小化当前盘位套保后的净波动"],
-        index=1,
-    )
-    fully_invested = st.sidebar.checkbox("最小方差模式下：权重和=1", value=True)
-    lambda_reg = st.sidebar.slider("套保调整惩罚 λ", 0.0, 5.0, 0.5, 0.1)
-    net_constraint = st.sidebar.slider("套保overlay净敞口约束(权重和)", -1.0, 1.0, 0.0, 0.1)
+    st.sidebar.subheader("因子覆盖目标（仅FactorCover模式）")
+    gamma = st.sidebar.slider("波动惩罚 γ", 0.0, 5.0, 1.0, 0.1)
+    lam_factor = st.sidebar.slider("因子贴合权重 λ_f", 0.0, 10.0, 3.0, 0.1)
+    b1 = st.sidebar.slider("目标因子1(Global Energy)", -2.0, 2.0, 0.5, 0.1)
+    b2 = st.sidebar.slider("目标因子2(Atlantic-Pacific Gas)", -2.0, 2.0, 0.0, 0.1)
+    b3 = st.sidebar.slider("目标因子3(Oil-specific)", -2.0, 2.0, 0.2, 0.1)
 
-    st.sidebar.header("5) 动态再平衡")
-    dyn_lookback = st.sidebar.slider("协方差回看窗口(天)", 20, 252, 90, 5)
-    rebalance_days = st.sidebar.slider("再平衡频率(天)", 5, 60, 20, 5)
+    prices = {}
+    errs = []
+    for a in ASSETS:
+        try:
+            if a == "JKM" and upload_jkm is not None:
+                prices[a] = parse_uploaded_csv(upload_jkm)
+            else:
+                if not tickers[a]:
+                    raise ValueError("请填写ticker或上传CSV")
+                prices[a] = load_yahoo_series(tickers[a], start_date.isoformat(), end_date.isoformat())
+        except Exception as e:
+            errs.append(f"{a} 数据失败: {e}")
 
-    prices_dict, errors = {}, []
-    for asset in ["Brent", "HenryHub", "TTF", "JKM"]:
-        loaded = False
-        if use_yahoo_for_all and yf is not None:
-            try:
-                prices_dict[asset] = load_yahoo_series(
-                    custom_tickers[asset], start_date.isoformat(), end_date.isoformat()
-                )
-                loaded = True
-            except Exception as e:
-                errors.append(f"{asset} yfinance失败: {e}")
+    if errs:
+        st.warning("\n".join(errs))
 
-        if not loaded and asset == "TTF" and ttf_upload is not None:
-            try:
-                prices_dict[asset] = parse_uploaded_csv(ttf_upload)
-                loaded = True
-            except Exception as e:
-                errors.append(f"TTF CSV失败: {e}")
-
-        if not loaded and asset == "JKM" and jkm_upload is not None:
-            try:
-                prices_dict[asset] = parse_uploaded_csv(jkm_upload)
-                loaded = True
-            except Exception as e:
-                errors.append(f"JKM CSV失败: {e}")
-
-    if errors:
-        st.sidebar.warning("\n".join(errors))
-
-    if len(prices_dict) < 2:
-        st.warning("可用价格序列不足，至少需要两个品种。")
+    if len(prices) < 2:
+        st.error("有效品种不足，无法优化。")
         return
 
-    df_prices = pd.concat(prices_dict.values(), axis=1, join="inner")
-    df_prices.columns = list(prices_dict.keys())
-    df_prices = df_prices[(df_prices.index >= pd.to_datetime(start_date)) & (df_prices.index <= pd.to_datetime(end_date))]
-    df_returns = compute_returns(df_prices)
-    if df_returns.empty:
-        st.warning("收益率数据为空，请调整时间范围或数据源。")
+    df = pd.concat(prices.values(), axis=1).sort_index()
+    df.columns = list(prices.keys())
+    df = df[(df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))]
+    df = df.ffill(limit=3).dropna(how="any")
+    rets = compute_returns(df)
+    if rets.empty:
+        st.error("收益率为空，请检查数据。")
         return
 
-    st.subheader("价格走势")
-    st.line_chart(df_prices)
-
-    st.subheader("相关性（收益率 + 波动率）")
+    st.subheader("价格与相关性")
+    st.line_chart(df)
     st.write("收益率相关")
-    st.dataframe(df_returns.corr())
-    df_vol = compute_volatility(df_returns, window)
+    st.dataframe(rets.corr())
     st.write("滚动波动率相关")
-    st.dataframe(df_vol.corr() if not df_vol.empty else pd.DataFrame())
+    st.dataframe(rolling_vol(rets, vol_window).dropna().corr())
 
-    cov = df_returns.cov().values
-    cols = df_returns.columns.tolist()
+    cov = estimate_covariance(rets, cov_method, ewma_lambda, shrink_alpha)
+    assets = rets.columns.tolist()
+    lb_arr = np.array([lb.get(a, 0.0) for a in assets])
+    ub_arr = np.array([ub.get(a, 1.0) for a in assets])
+
+    if lb_arr.sum() > 1 + 1e-9 or ub_arr.sum() < 1 - 1e-9:
+        st.error("约束不可行：下限和>1 或 上限和<1。")
+        return
+
+    if mode == "MinVar(无约束)":
+        w = solve_minvar(cov)
+    elif mode == "MinVar(带约束)":
+        w = solve_minvar(cov, lb_arr, ub_arr)
+    elif mode == "RiskParity":
+        w = solve_risk_parity(cov, lb_arr, ub_arr)
+    else:
+        B = pca_factor_loadings(rets, n_factors=3)
+        b_star = np.array([b1, b2, b3])
+        w = solve_factor_cover(cov, B, b_star, gamma, lam_factor, lb_arr, ub_arr)
+
+    port_vol = float(np.sqrt(w.T @ cov @ w) * np.sqrt(252))
+    out = pd.Series(w, index=assets, name="weight")
 
     st.subheader("优化结果")
-    if objective.startswith("最小方差组合"):
-        w = minimum_variance_weights(cov, fully_invested=fully_invested)
-        final_w = pd.Series(w, index=cols, name="weight")
-        port_vol = float(np.sqrt(w.T @ cov @ w) * np.sqrt(252))
-        st.write("最优权重")
-        st.dataframe(final_w.to_frame())
-        st.metric("年化波动率", f"{port_vol:.2%}")
-    else:
-        base_vec = np.array([base_pos.get(c, 0.0) for c in cols], dtype=float)
-        if np.allclose(base_vec, 0):
-            st.warning("当前盘位全为0，无法体现套保效果。请输入至少一个非零暴露。")
-            return
+    st.dataframe(out.to_frame())
+    st.metric("组合年化波动", f"{port_vol:.2%}")
 
-        overlay = optimize_hedge_overlay(cov, base_vec, lambda_reg, net_constraint)
-        hedged = base_vec + overlay
+    if mode in ["RiskParity", "FactorCover+RiskBudget"]:
+        rc = pd.Series(risk_contributions(cov, w), index=assets, name="risk_contribution")
+        st.write("风险贡献")
+        st.dataframe(rc.to_frame())
 
-        base_vol = float(np.sqrt(base_vec.T @ cov @ base_vec) * np.sqrt(252))
-        hedged_vol = float(np.sqrt(hedged.T @ cov @ hedged) * np.sqrt(252))
-        eff = 1 - (hedged_vol**2 / base_vol**2) if base_vol > 0 else np.nan
-
-        res = pd.DataFrame(
-            {
-                "BaseExposure": base_vec,
-                "Overlay": overlay,
-                "PostHedgeExposure": hedged,
-            },
-            index=cols,
-        )
-        st.dataframe(res)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("套保前年化波动", f"{base_vol:.2%}")
-        c2.metric("套保后年化波动", f"{hedged_vol:.2%}")
-        c3.metric("方差口径套保效率", f"{eff:.2%}")
-
-        if len(df_returns) > dyn_lookback + rebalance_days:
-            sim = simulate_dynamic_hedge(
-                df_returns, base_vec, dyn_lookback, rebalance_days, lambda_reg, net_constraint
-            )
-            if not sim.empty:
-                st.subheader("动态再平衡表现")
-                nav = (1 + sim[["Base", "Hedged"]]).cumprod()
-                st.line_chart(nav)
-                sim_eff = 1 - (sim["Hedged"].var() / sim["Base"].var()) if sim["Base"].var() != 0 else np.nan
-                st.metric("动态样本内套保效率", f"{sim_eff:.2%}")
-                overlay_cols = [c for c in sim.columns if c.startswith("overlay_")]
-                st.write("Overlay路径")
-                st.line_chart(sim[overlay_cols])
+    if mode == "FactorCover+RiskBudget":
+        B = pca_factor_loadings(rets, n_factors=3)
+        exposure = pd.Series(B.T @ w, index=["F1", "F2", "F3"], name="realized_factor_exposure")
+        target = pd.Series([b1, b2, b3], index=["F1", "F2", "F3"], name="target_factor_exposure")
+        st.write("因子暴露：目标 vs 实现")
+        st.dataframe(pd.concat([target, exposure], axis=1))
 
 
 if __name__ == "__main__":
