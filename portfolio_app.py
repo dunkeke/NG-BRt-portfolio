@@ -17,12 +17,13 @@ DEFAULT_TICKERS = {
 }
 
 
-DEFAULT_TICKERS = {
-    "Brent": "BZ=F",
-    "HenryHub": "NG=F",
-    "TTF": "TTF=F",
-    "JKM": "JKM=F",
-}
+def normalize_asset_name(asset: str) -> str:
+    alias = {
+        "HenryHub": "HH",
+        "Henry Hub": "HH",
+        "BRT": "Brent",
+    }
+    return alias.get(asset, asset)
 
 
 def load_yahoo_series(ticker: str, start: str, end: str) -> pd.Series:
@@ -201,8 +202,10 @@ def app():
 
     st.sidebar.subheader("数据源")
     tickers = {}
-    for a in ASSETS:
-        tickers[a] = st.sidebar.text_input(f"{a} ticker", DEFAULT_TICKERS[a])
+    for raw_a in ASSETS:
+        a = normalize_asset_name(raw_a)
+        default_ticker = DEFAULT_TICKERS.get(a, "")
+        tickers[a] = st.sidebar.text_input(f"{a} ticker", default_ticker)
     upload_jkm = st.sidebar.file_uploader("JKM CSV（优先上传）", type=["csv"])
 
     st.sidebar.subheader("优化模式")
@@ -226,14 +229,16 @@ def app():
 
     prices = {}
     errs = []
-    for a in ASSETS:
+    for raw_a in ASSETS:
+        a = normalize_asset_name(raw_a)
         try:
             if a == "JKM" and upload_jkm is not None:
                 prices[a] = parse_uploaded_csv(upload_jkm)
             else:
-                if not tickers[a]:
+                ticker = tickers.get(a, "")
+                if not ticker:
                     raise ValueError("请填写ticker或上传CSV")
-                prices[a] = load_yahoo_series(tickers[a], start_date.isoformat(), end_date.isoformat())
+                prices[a] = load_yahoo_series(ticker, start_date.isoformat(), end_date.isoformat())
         except Exception as e:
             errs.append(f"{a} 数据失败: {e}")
 
