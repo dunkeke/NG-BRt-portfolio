@@ -20,10 +20,29 @@ DEFAULT_TICKERS = {
 def load_yahoo_series(ticker: str, start: str, end: str) -> pd.Series:
     if yf is None:
         raise RuntimeError("yfinance is not installed. Please install yfinance or upload data.")
-    df = yf.download(ticker, start=start, end=end, progress=False)
+
+    df = pd.DataFrame()
+    dl = getattr(yf, "download", None)
+    if callable(dl):
+        try:
+            df = dl(ticker, start=start, end=end, progress=False)
+        except Exception:
+            df = pd.DataFrame()
+
+    if df.empty:
+        tk = yf.Ticker(ticker)
+        df = tk.history(start=start, end=end, auto_adjust=False)
+
     if df.empty:
         raise ValueError(f"No data returned for ticker {ticker}.")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
     price_col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    if price_col not in df.columns:
+        raise ValueError(f"Ticker {ticker} missing Close/Adj Close column.")
+
     return df[price_col].rename(ticker)
 
 
