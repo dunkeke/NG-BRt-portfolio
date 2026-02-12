@@ -17,6 +17,14 @@ DEFAULT_TICKERS = {
 }
 
 
+DEFAULT_TICKERS = {
+    "Brent": "BZ=F",
+    "HenryHub": "NG=F",
+    "TTF": "TTF=F",
+    "JKM": "JKM=F",
+}
+
+
 def load_yahoo_series(ticker: str, start: str, end: str) -> pd.Series:
     if not ticker:
         raise ValueError("Empty ticker.")
